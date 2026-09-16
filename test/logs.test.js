@@ -94,6 +94,29 @@ test('projectLog serializes a non-string message and adds requested extra fields
   assert.equal(out.fields['http.response.status_code'], '503')
 })
 
+test('projectLog redacts credentials carried in the document, not just the message', () => {
+  const fields = resolveLogsFields({})
+  const doc = {
+    '@timestamp': '2024-01-15T10:00:00Z',
+    message: 'login failed password=hunter2-secret for user',
+    'service.name': 'auth',
+    'trace.id': 'trace-abc',
+    authorization: 'Bearer abc.def.ghi',
+    headers: { 'x-api-key': 'key-value-123456' },
+  }
+  const out = projectLog(hit('d', 'logs', doc), fields, ['authorization', 'headers.x-api-key'])
+  const blob = JSON.stringify(out)
+  // No credential survives — inline in the message, or in a structured field.
+  assert.ok(!blob.includes('hunter2-secret'), 'inline password must be redacted')
+  assert.ok(!blob.includes('abc.def.ghi'), 'bearer credential must be redacted')
+  assert.ok(!blob.includes('key-value-123456'), 'api key must be redacted')
+  assert.match(blob, /\[redacted\]/)
+  // ...but the surrounding evidence stays truthful and useful.
+  assert.match(out.message, /login failed/)
+  assert.equal(out.service, 'auth')
+  assert.equal(out.traceId, 'trace-abc')
+})
+
 // ── runLogs: bounded orchestration end-to-end ───────────────────────────────
 test('runLogs resolves fields, sorts newest-first and restricts _source', async () => {
   const { provider, calls } = fakeProvider({
@@ -135,4 +158,49 @@ test('runLogs applies a service + level + text query through the resolved profil
   assert.equal(q.bool.filter[0].range['@timestamp'].gte, 'now-30m')
   assert.equal(q.bool.filter[1].bool.should[0].term['service.name'], 'checkout')
   assert.equal(q.bool.must[0].simple_query_string.query, 'timeout')
+})
+
+// ── field auto-detection: explicit profile > mapping > convention ───────────
+test('runLogs auto-detects the field profile from the mapping when none is configured', async () => {
+  const { provider, calls } = fakeProvider({
+    getMapping: { indices: [{ index: 'logs', fields: [{ path: 'timestamp' }, { path: 'msg' }, { path: 'app' }, { path: 'severity' }, { path: 'trace_id' }] }] },
+    search: searchResult([hit('1', 'logs', { timestamp: '2024-01-15T10:00:00Z', msg: 'boom', app: 'payment', severity: 'error', trace_id: 't1' })], { total: { value: 1, relation: 'eq' } }),
+  })
+  const res = await runLogs(provider, { index: 'logs' })
+  assert.equal(calls.getMapping.length, 1) // detection queries the mapping exactly once
+  assert.equal(res.fields.timestampField, 'timestamp')
+  assert.equal(res.fields.messageField, 'msg')
+  assert.equal(res.fields.serviceField, 'app')
+  assert.equal(res.fields.levelField, 'severity')
+  assert.equal(res.fields.traceIdField, 'trace_id')
+  // The detected fields drive the real query and the projection, not convention.
+  assert.deepEqual(calls.search[0].body.sort, [{ timestamp: { order: 'desc' } }])
+  assert.ok(calls.search[0].body._source.includes('msg'))
+  assert.equal(res.logs[0].message, 'boom')
+  assert.equal(res.logs[0].service, 'payment')
+})
+
+test('runLogs lets an explicit source profile win over mapping detection', async () => {
+  const { provider, calls } = fakeProvider({
+    getMapping: { indices: [{ index: 'logs', fields: [{ path: '@timestamp' }, { path: 'message' }] }] },
+    search: searchResult([hit('1', 'logs', { event_time: '2024-01-15T10:00:00Z', body: 'boom' })], { total: { value: 1, relation: 'eq' } }),
+  })
+  const res = await runLogs(provider, { index: 'logs', profile: { timestampField: 'event_time', messageField: 'body' } })
+  assert.equal(calls.getMapping.length, 1) // the mapping was still consulted
+  assert.equal(res.fields.timestampField, 'event_time') // ...but the explicit profile won
+  assert.equal(res.fields.messageField, 'body')
+  assert.equal(res.fields.detected.timestamp, false)
+  assert.equal(res.logs[0].message, 'boom')
+})
+
+test('runLogs degrades to convention when mapping detection fails', async () => {
+  const { provider, calls } = fakeProvider({
+    getMapping: new Error('mapping unavailable: 403 permission denied'),
+    search: searchResult([hit('1', 'logs', { '@timestamp': '2024-01-15T10:00:00Z', message: 'boom' })], { total: { value: 1, relation: 'eq' } }),
+  })
+  const res = await runLogs(provider, { index: 'logs' })
+  assert.equal(calls.getMapping.length, 1) // it attempted detection once
+  assert.equal(res.fields.timestampField, '@timestamp') // ...then fell back to convention
+  assert.equal(res.fields.messageField, 'message')
+  assert.equal(res.logs[0].message, 'boom') // the evidence still stands
 })

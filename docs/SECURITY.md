@@ -114,6 +114,11 @@ what can be reached:
 Every tool is bounded so one call cannot pull gigabytes into the model context.
 When a bound is hit, the result **discloses** truncation (`returned` vs `total`,
 `truncated: true`, and a `budget:` note) instead of silently dropping rows.
+`truncated` is *truthful*, not merely "fewer rows than the page size": it is set
+only when the total relation proves more matches existed than were returned
+(`total.value > returned` for an exact `eq` count, `>=` for a lower-bound `gte`
+count), so a complete small result is never mislabeled as truncated. Evidence
+must be bounded, but the bounds must be truthful.
 
 | Concern | Default | Hard cap | Constant |
 | --- | --- | --- | --- |
@@ -198,13 +203,51 @@ output is structured and wrapped, never narrated:
 
 ## Sensitive logs and error text
 
-Logs routinely contain secrets (tokens in a URL, an `Authorization` header echoed
-by a proxy). The plugin assumes any upstream body may leak one:
+Logs routinely contain secrets — a token in a URL, an `Authorization` header
+echoed by a proxy, a `password=` in a debug line. The plugin assumes **any value
+read back from the cluster is untrusted and may carry a credential**, and defends
+two distinct surfaces with two deterministic layers.
 
-- **`redactSecrets`** scrubs Bearer tokens, HTTP Basic credentials, common
-  `api_key/token/secret/password` shapes, `sk-…` keys and long base64/hex runs
-  before any fragment is surfaced. Legitimate log text survives because real
-  identifiers are broken up by underscores, dots and spaces.
+### Indexed evidence: `sanitizeDocument` at the egress boundary
+
+SearchOps must not knowingly forward an obvious credential from indexed data into
+the model context. Every document value that leaves the domain — a projected log
+line, an investigation sample, a correlated-context line, an aggregation bucket
+key, and the raw `_source` echoed by `searchops_query` — passes through
+`sanitizeDocument` (`lib/util.js`) *immediately before egress*, applied once at
+the boundary in `lib/logs.js` (`projectLog`), `lib/patterns.js`
+(`groupPatterns`), `lib/aggregate.js` (bucket keys) and `lib/tools/search.js`
+(query output):
+
+- **Key-name redaction** — a field whose name is credential-shaped (`password`,
+  `passwd`, `pwd`, `secret`, `token`, `authorization`, `cookie`, `credential`,
+  `api_key`, `access_token`, `refresh_token`, `client_secret`, …, matched
+  case-insensitively across snake/camel/kebab and nested objects) has its
+  **value** replaced with `[redacted]`, recursively through arrays and
+  sub-objects.
+- **String-content redaction** — inside any surviving string, obvious credential
+  shapes (`Authorization: Bearer …`, `Basic …`, `password=…`, `api_key=…`,
+  `token=…`, `sk-…`) are replaced with `[redacted]` while the surrounding,
+  non-secret text is preserved so the evidence stays useful.
+
+This is a **best-effort, deterministic** guard, not a DLP system. It deliberately
+targets only high-confidence credential shapes and key names, and errs toward
+keeping evidence: it does *not* scrub arbitrary high-entropy strings, so trace
+ids, request ids and ordinary long identifiers survive intact. It will not catch
+every secret — a credential in a free-form message with no recognizable shape can
+still slip through. The guarantee is narrower and honest: SearchOps never
+*knowingly* forwards an obvious credential, and innocent content (`token_count`,
+`password_policy_enabled`, `secretary`) is never redacted.
+
+### Upstream and error text: `redactSecrets`
+
+Error paths handle raw upstream bytes, which may echo a credential *or* be a
+high-entropy blob, so they use the broader `redactSecrets`:
+
+- **`redactSecrets`** applies the same credential patterns **plus** long
+  base64/hex runs before any fragment is surfaced in an error. Legitimate log
+  text survives because real identifiers are broken up by underscores, dots and
+  spaces.
 - **Error bodies are untrusted.** `translateHttpFailure` / `safeErrorDetail`
   extract a short reason, then `redactSecrets` + `oneLine` + truncate to
   300 chars (`ERROR_DETAIL_MAX_CHARS`). Request headers are never printed.
@@ -229,10 +272,13 @@ network/TLS) — and never as a bare `catch (e) { return "error" }`.
 | One query pulls gigabytes | Streamed 4 MiB byte cap, size/offset/bucket/line caps, 31-day window, truncation disclosure |
 | Agent reaches an unintended host/path | Operator-configured base URL, index-pattern allow-list, HTTPS-or-loopback policy |
 | Log text hijacks the agent | Untrusted-data handling: single-lined, truncated, structured, never instructions |
+| Indexed log data carries a credential | `sanitizeDocument` at the evidence egress boundary (key-name + credential-shape redaction), best-effort |
 | Upstream body echoes a secret | `redactSecrets` on every surfaced fragment; bounded error detail |
 | Silent data loss | Explicit `truncated` / `returned` vs `total` / `budget:` disclosure |
 | Accidental mutation | Read-only by construction; no write path; no generic HTTP proxy |
 
 These behaviors are covered by automated tests (see `test/runtime.test.js`,
-`test/failures.test.js`, `test/util.test.js`, `test/tools.test.js`), which run
-against an in-process HTTP mock and require no public service.
+`test/failures.test.js`, `test/util.test.js`, `test/logs.test.js`,
+`test/aggregate.test.js`, `test/context.test.js`, `test/fields.test.js`,
+`test/tools.test.js`), which run against an in-process HTTP mock and require no
+public service.

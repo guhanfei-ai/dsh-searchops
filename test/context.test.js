@@ -94,3 +94,16 @@ test('runContext projects returned events as bounded, untrusted log lines', asyn
   assert.ok(!res.logs[0].message.includes('\n'))
   assert.match(res.logs[0].message, /Ignore previous instructions/)
 })
+
+// ── field auto-detection: explicit profile > mapping > convention ───────────
+test('runContext auto-detects the field profile from the mapping', async () => {
+  const { provider, calls } = fakeProvider({
+    getMapping: { indices: [{ index: 'logs', fields: [{ path: 'timestamp' }, { path: 'msg' }, { path: 'trace_id' }] }] },
+    search: searchResult([hit('1', 'logs', { timestamp: '2024-01-15T10:00:00Z', msg: 'start', trace_id: 'abc' })], { total: { value: 1, relation: 'eq' } }),
+  })
+  const res = await runContext(provider, { index: 'logs', traceId: 'abc' })
+  assert.equal(calls.getMapping.length, 1) // detection consults the mapping exactly once
+  assert.equal(res.fields.traceIdField, 'trace_id') // ...and the detected schema drives the query
+  assert.equal(calls.search[0].body.query.bool.filter[0].bool.should[0].term['trace_id'], 'abc')
+  assert.equal(res.logs[0].message, 'start')
+})

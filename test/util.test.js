@@ -12,6 +12,7 @@ import {
   combineSignals,
   generateSourceId,
   isPlainObject,
+  isSensitiveKey,
   normalizeBaseUrl,
   normalizeSourceName,
   oneLine,
@@ -20,6 +21,7 @@ import {
   redactSecrets,
   requireBoundedInteger,
   safeErrorDetail,
+  sanitizeDocument,
   textOut,
   tokenRefForId,
   truncate,
@@ -243,4 +245,77 @@ test('isPlainObject distinguishes objects from arrays and null', () => {
 test('textOut wraps a value in a single text content block', () => {
   assert.deepEqual(textOut('hello'), [{ type: 'text', text: 'hello' }])
   assert.deepEqual(textOut(42), [{ type: 'text', text: '42' }])
+})
+
+// ── document sanitization (the indexed-evidence redaction boundary) ──────────
+test('isSensitiveKey flags credential field names across naming styles', () => {
+  const sensitive = [
+    'password', 'user_password', 'passwd', 'pwd', 'secret', 'client_secret',
+    'token', 'access_token', 'refresh_token', 'authorization', 'Authorization',
+    'cookie', 'set-cookie', 'Set-Cookie', 'api_key', 'apiKey', 'apikey',
+    'x-api-key', 'headers.x-api-key', 'credential', 'credentials', 'proxy-authorization',
+  ]
+  for (const key of sensitive) assert.equal(isSensitiveKey(key), true, `${key} should be sensitive`)
+})
+
+test('isSensitiveKey does NOT flag innocent look-alikes', () => {
+  const innocent = [
+    'token_count', 'max_tokens', 'tokens_per_second', 'password_policy_enabled',
+    'secretary', 'timestamp', '@timestamp', 'message', 'service.name', 'trace.id',
+    'log.level', 'http.response.status_code', 'user_id', 'request_id',
+    'primary_key', 'keyword', 'monkey',
+  ]
+  for (const key of innocent) assert.equal(isSensitiveKey(key), false, `${key} should NOT be sensitive`)
+})
+
+test('sanitizeDocument redacts by key name and by credential shape in strings', () => {
+  const out = sanitizeDocument({
+    message: 'login failed password=hunter2-secret for user',
+    authorization: 'Bearer abc.def.ghi',
+    token_count: 123,
+    password_policy_enabled: true,
+    service: 'auth',
+  })
+  assert.equal(out.authorization, '[redacted]') // sensitive key -> value replaced wholesale
+  assert.match(out.message, /login failed \[redacted\] for user/) // inline shape; context kept
+  assert.equal(out.token_count, 123) // innocent key preserved
+  assert.equal(out.password_policy_enabled, true) // innocent key preserved
+  assert.equal(out.service, 'auth')
+})
+
+test('sanitizeDocument recurses through nested objects and arrays', () => {
+  const out = sanitizeDocument({
+    headers: { authorization: 'Bearer xyz', 'x-api-key': 'k-123456', accept: 'application/json' },
+    tags: ['ok', 'token=abcdef123456', 'Bearer aaa.bbb.ccc'],
+    attempts: [{ password: 'p@ssw0rd-secret', user: 'alice' }],
+  })
+  assert.equal(out.headers.authorization, '[redacted]')
+  assert.equal(out.headers['x-api-key'], '[redacted]')
+  assert.equal(out.headers.accept, 'application/json') // innocent nested value kept
+  assert.equal(out.tags[0], 'ok')
+  assert.ok(!out.tags[1].includes('abcdef123456'))
+  assert.ok(!out.tags[2].includes('aaa.bbb.ccc'))
+  assert.equal(out.attempts[0].password, '[redacted]')
+  assert.equal(out.attempts[0].user, 'alice')
+})
+
+test('sanitizeDocument preserves trace ids and hashes (evidence-safe tier only)', () => {
+  const out = sanitizeDocument({
+    'trace.id': '4f9c1a2b3d4e5f60718293a4b5c6d7e8',
+    message: 'request 550e8400-e29b-41d4-a716-446655440000 ok',
+  })
+  // A 32-hex trace id / UUID is legitimate evidence, NOT scrubbed — the blunt
+  // high-entropy tier is reserved for untrusted error bodies (redactSecrets).
+  assert.equal(out['trace.id'], '4f9c1a2b3d4e5f60718293a4b5c6d7e8')
+  assert.match(out.message, /550e8400-e29b-41d4-a716-446655440000/)
+})
+
+test('sanitizeDocument passes primitives through and never mutates the input', () => {
+  assert.equal(sanitizeDocument(42), 42)
+  assert.equal(sanitizeDocument(true), true)
+  assert.equal(sanitizeDocument(null), null)
+  const input = { password: 'hunter2-secret', nested: { token: 'abcdef123456' } }
+  const snapshot = JSON.stringify(input)
+  sanitizeDocument(input)
+  assert.equal(JSON.stringify(input), snapshot) // the original document is untouched
 })

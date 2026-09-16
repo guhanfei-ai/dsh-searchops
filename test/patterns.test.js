@@ -108,3 +108,19 @@ test('groupPatterns ignores empty messages and tolerates non-array input', () =>
   assert.equal(res.patterns[0].label, 'real')
   assert.deepEqual(groupPatterns(null, {}).patterns, [])
 })
+
+test('groupPatterns redacts credentials in the fingerprint label and sample', () => {
+  const hits = [hit('1', 'logs', {
+    '@timestamp': '2024-01-15T10:00:00Z',
+    message: 'auth failed Authorization: Bearer abc.def.ghi',
+    'service.name': 'auth',
+    'trace.id': 'trace-1',
+  })]
+  const res = groupPatterns(hits, {})
+  const blob = JSON.stringify(res.patterns)
+  assert.ok(!blob.includes('abc.def.ghi'), 'a bearer credential must not survive into pattern evidence')
+  assert.match(blob, /\[redacted\]/)
+  // Deterministic correlation is preserved: trace ids and services are not secrets.
+  assert.deepEqual(res.patterns[0].traceIds, ['trace-1'])
+  assert.deepEqual(res.patterns[0].services, ['auth'])
+})

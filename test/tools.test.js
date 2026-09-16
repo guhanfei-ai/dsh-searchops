@@ -154,10 +154,30 @@ test('searchops_query rejects an index pattern with path-injection characters', 
   }
 })
 
+test('searchops_query redacts credentials embedded in _source (no JSON.stringify bypass)', async () => {
+  const { tools } = setup()
+  const secretSource = {
+    '@timestamp': '2024-01-15T10:00:00Z',
+    message: 'request ok',
+    password: 'hunter2-secret',
+    note: 'calling with token=abcdef123456 now',
+  }
+  const mock = mockCluster([[_search(), osSearch({ hits: [{ _id: '1', _index: 'logs', _source: secretSource }], total: { value: 1, relation: 'eq' } })]])
+  try {
+    const out = await toolByName(tools, 'searchops_query').execute({ index: 'logs', source: 'prod' }, execution())
+    assert.ok(!out.includes('hunter2-secret'), 'a structured password field must be redacted')
+    assert.ok(!out.includes('abcdef123456'), 'an inline token must be redacted')
+    assert.match(out, /\[redacted\]/)
+    assert.match(out, /request ok/) // innocent content is preserved
+  } finally {
+    mock.restore()
+  }
+})
+
 // ── searchops_logs: semantic query ──────────────────────────────────────────
 test('searchops_logs resolves fields, renders lines and reports the range', async () => {
   const { tools } = setup()
-  const mock = mockCluster([[_search(), osSearch({ hits: [{ _id: '1', _index: 'logs', _source: LOG_SOURCE }], total: { value: 1, relation: 'eq' }, took: 9 })]])
+  const mock = mockCluster([[/_mapping$/, osMapping('logs', logMappingProperties())], [_search(), osSearch({ hits: [{ _id: '1', _index: 'logs', _source: LOG_SOURCE }], total: { value: 1, relation: 'eq' }, took: 9 })]])
   try {
     const out = await toolByName(tools, 'searchops_logs').execute({ index: 'logs', level: 'error', source: 'prod' }, execution())
     assert.match(out, /range=now-1h\.\.now/)
@@ -172,7 +192,7 @@ test('searchops_logs resolves fields, renders lines and reports the range', asyn
 // ── searchops_aggregate ─────────────────────────────────────────────────────
 test('searchops_aggregate renders group buckets', async () => {
   const { tools } = setup()
-  const mock = mockCluster([[_search(), osSearch({ hits: [], total: { value: 8, relation: 'eq' }, aggregations: { group_by: { buckets: [{ key: 'checkout', doc_count: 5 }, { key: 'payment', doc_count: 3 }] } } })]])
+  const mock = mockCluster([[/_mapping$/, osMapping('logs', logMappingProperties())], [_search(), osSearch({ hits: [], total: { value: 8, relation: 'eq' }, aggregations: { group_by: { buckets: [{ key: 'checkout', doc_count: 5 }, { key: 'payment', doc_count: 3 }] } } })]])
   try {
     const out = await toolByName(tools, 'searchops_aggregate').execute({ index: 'logs', groupBy: 'service', source: 'prod' }, execution())
     assert.match(out, /groups by "service\.name"/)
@@ -186,7 +206,7 @@ test('searchops_aggregate renders group buckets', async () => {
 // ── searchops_context ───────────────────────────────────────────────────────
 test('searchops_context renders a trace correlation', async () => {
   const { tools } = setup()
-  const mock = mockCluster([[_search(), osSearch({ hits: [{ _id: '1', _index: 'logs', _source: LOG_SOURCE }], total: { value: 1, relation: 'eq' }, took: 2 })]])
+  const mock = mockCluster([[/_mapping$/, osMapping('logs', logMappingProperties())], [_search(), osSearch({ hits: [{ _id: '1', _index: 'logs', _source: LOG_SOURCE }], total: { value: 1, relation: 'eq' }, took: 2 })]])
   try {
     const out = await toolByName(tools, 'searchops_context').execute({ index: 'logs', traceId: 't1', source: 'prod' }, execution())
     assert.match(out, /context for trace="t1"/)

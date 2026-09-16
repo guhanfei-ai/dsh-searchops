@@ -7,7 +7,9 @@ import {
   profileSourceFields,
   resolveFieldProfile,
   resolveProfileConfig,
+  resolveSourceFields,
 } from '../lib/fields.js'
+import { fakeProvider } from './support.mjs'
 
 // ── getByPath: literal flattened key first, then nested traversal ───────────
 test('getByPath reads a literal dotted key when present', () => {
@@ -131,4 +133,48 @@ test('flattenMappingProperties tolerates empty or malformed input', () => {
   assert.deepEqual(flattenMappingProperties(null), [])
   assert.deepEqual(flattenMappingProperties({}), [])
   assert.deepEqual(flattenMappingProperties({ a: null }), [])
+})
+
+// ── resolveSourceFields: one mapping read, graceful degradation, short-circuit ─
+test('resolveSourceFields detects the schema from the mapping when no profile is set', async () => {
+  const { provider, calls } = fakeProvider({
+    getMapping: { indices: [{ index: 'logs', fields: [{ path: 'timestamp' }, { path: 'msg' }, { path: 'app' }] }] },
+  })
+  const { fields, availableFields, mappingError } = await resolveSourceFields(provider, { index: 'logs' })
+  assert.equal(calls.getMapping.length, 1) // detection reads the mapping exactly once
+  assert.equal(mappingError, null)
+  assert.equal(fields.timestampField, 'timestamp')
+  assert.equal(fields.messageField, 'msg')
+  assert.equal(fields.serviceField, 'app')
+  assert.ok(availableFields instanceof Set)
+  assert.ok(availableFields.has('msg'))
+})
+
+test('resolveSourceFields lets an explicit profile win over detection', async () => {
+  const { provider } = fakeProvider({
+    getMapping: { indices: [{ index: 'logs', fields: [{ path: '@timestamp' }, { path: 'message' }] }] },
+  })
+  const { fields } = await resolveSourceFields(provider, { index: 'logs', profile: { messageField: 'body' } })
+  assert.equal(fields.messageField, 'body') // configured wins
+  assert.equal(fields.detected.message, false)
+  assert.equal(fields.timestampField, '@timestamp') // unconfigured role is still detected
+  assert.equal(fields.detected.timestamp, true)
+})
+
+test('resolveSourceFields degrades to convention and reports why when the mapping fails', async () => {
+  const { provider, calls } = fakeProvider({ getMapping: new Error('mapping unavailable: 403 permission denied') })
+  const { fields, availableFields, mappingError } = await resolveSourceFields(provider, { index: 'logs' })
+  assert.equal(calls.getMapping.length, 1)
+  assert.match(mappingError, /mapping unavailable/)
+  assert.equal(fields.timestampField, '@timestamp')
+  assert.equal(fields.messageField, 'message')
+  assert.ok(availableFields instanceof Set)
+  assert.equal(availableFields.size, 0) // empty, never null — so a caller never re-queries
+})
+
+test('resolveSourceFields skips the mapping round-trip when the caller already resolved the schema', async () => {
+  const { provider, calls } = fakeProvider({ getMapping: { indices: [] } })
+  const { fields } = await resolveSourceFields(provider, { index: 'logs', availableFields: new Set(['ts', 'msg']) })
+  assert.equal(calls.getMapping.length, 0) // investigate threads its single read down
+  assert.equal(fields.messageField, 'msg')
 })

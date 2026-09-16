@@ -452,6 +452,12 @@ decide the root cause. That reasoning is the model's job.
   offset limits, and a maximum time window stop one query from pulling gigabytes.
 - **Sanitized errors.** Upstream bodies are untrusted and may echo credentials;
   they are redacted, single-lined and truncated before reaching any message.
+- **Redacted evidence.** Indexed log data is untrusted too and may carry a secret
+  (an echoed `Authorization` header, a `password=` in a message). Documents are
+  sanitized on the way out — credential-shaped fields (`password`, `token`,
+  `api_key`, …) and obvious in-text credential shapes become `[redacted]` — on a
+  best-effort, deterministic basis before they reach a tool result, the model
+  context or the UI.
 - **Untrusted data.** All returned content is data, never instructions (below).
 
 ---

@@ -98,3 +98,26 @@ test('runAggregate applies a text filter alongside the time range', async () => 
   assert.equal(filter[0].range['@timestamp'].gte, 'now-2h')
   assert.equal(filter[1].simple_query_string.query, 'timeout')
 })
+
+// ── bucket keys are untrusted evidence too ──────────────────────────────────
+test('runAggregate redacts a credential-shaped bucket key', async () => {
+  const { provider } = fakeProvider({
+    search: searchResult([], { aggregations: { group_by: { buckets: [{ key: 'Bearer abc.def.ghi', doc_count: 2 }] } } }),
+  })
+  const res = await runAggregate(provider, { index: 'logs', groupBy: 'authorization' })
+  assert.ok(!res.groups[0].key.includes('abc.def.ghi'), 'a grouped credential value must be redacted')
+  assert.match(res.groups[0].key, /\[redacted\]/)
+  assert.equal(res.groups[0].count, 2)
+})
+
+// ── field auto-detection: the mapping drives the group field ────────────────
+test('runAggregate auto-detects the group field from the mapping', async () => {
+  const { provider, calls } = fakeProvider({
+    getMapping: { indices: [{ index: 'logs', fields: [{ path: 'timestamp' }, { path: 'msg' }, { path: 'app' }, { path: 'severity' }] }] },
+    search: searchResult([], { aggregations: { group_by: { buckets: [{ key: 'payment', doc_count: 5 }] } } }),
+  })
+  const res = await runAggregate(provider, { index: 'logs', groupBy: 'service' })
+  assert.equal(calls.getMapping.length, 1)
+  assert.equal(res.groupBy, 'app') // the 'service' role resolved to the detected app field
+  assert.equal(calls.search[0].body.aggs.group_by.terms.field, 'app')
+})

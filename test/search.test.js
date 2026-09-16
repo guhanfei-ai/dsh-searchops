@@ -11,6 +11,7 @@ import {
   buildSearchBody,
   clampFrom,
   clampSize,
+  computeTruncated,
   normalizeSourceFilter,
   normalizeTrackTotalHits,
   runSearch,
@@ -154,9 +155,68 @@ test('runSearch is not truncated when everything requested came back', async () 
   assert.equal(res.truncated, false)
 })
 
+// ── truncation truth table ──────────────────────────────────────────────────
+// `truncated` means "there is evidence that more matching documents existed but
+// were left out of the returned result" — NOT "fewer rows came back than the
+// size I asked for". A short result set that simply matched fewer documents is
+// complete, not truncated. The decision is driven by the total value + relation.
+
+test('runSearch is NOT truncated when it asked for 20 but only 3 matched (total eq 3)', async () => {
+  const hits = [hit('1', 'logs', {}), hit('2', 'logs', {}), hit('3', 'logs', {})]
+  const { provider } = fakeProvider({ search: searchResult(hits, { total: { value: 3, relation: 'eq' } }) })
+  const res = await runSearch(provider, { index: 'logs', body: buildSearchBody({ query: {}, size: 20 }) })
+  assert.equal(res.returned, 3)
+  assert.equal(res.requested, 20)
+  assert.equal(res.truncated, false)
+})
+
+test('runSearch IS truncated when 20 of 100 matches came back (total eq 100)', async () => {
+  const hits = Array.from({ length: 20 }, (_, i) => hit(String(i), 'logs', {}))
+  const { provider } = fakeProvider({ search: searchResult(hits, { total: { value: 100, relation: 'eq' } }) })
+  const res = await runSearch(provider, { index: 'logs', body: buildSearchBody({ query: {}, size: 20 }) })
+  assert.equal(res.returned, 20)
+  assert.equal(res.truncated, true)
+})
+
+test('runSearch IS truncated when the count is a lower bound (total gte 10000)', async () => {
+  const hits = Array.from({ length: 20 }, (_, i) => hit(String(i), 'logs', {}))
+  const { provider } = fakeProvider({ search: searchResult(hits, { total: { value: 10000, relation: 'gte' } }) })
+  const res = await runSearch(provider, { index: 'logs', body: buildSearchBody({ query: {}, size: 20 }) })
+  assert.equal(res.truncated, true)
+})
+
+test('runSearch is NOT truncated when all 20 matches came back (total eq 20)', async () => {
+  const hits = Array.from({ length: 20 }, (_, i) => hit(String(i), 'logs', {}))
+  const { provider } = fakeProvider({ search: searchResult(hits, { total: { value: 20, relation: 'eq' } }) })
+  const res = await runSearch(provider, { index: 'logs', body: buildSearchBody({ query: {}, size: 20 }) })
+  assert.equal(res.truncated, false)
+})
+
+test('runSearch IS truncated when the count itself hit the tracking budget (total gte 20, returned 20)', async () => {
+  const hits = Array.from({ length: 20 }, (_, i) => hit(String(i), 'logs', {}))
+  const { provider } = fakeProvider({ search: searchResult(hits, { total: { value: 20, relation: 'gte' } }) })
+  const res = await runSearch(provider, { index: 'logs', body: buildSearchBody({ query: {}, size: 20 }) })
+  assert.equal(res.truncated, true)
+})
+
 test('runSearch forwards aggregations from the provider result', async () => {
   const aggs = { group_by: { buckets: [{ key: 'payment', doc_count: 3 }] } }
   const { provider } = fakeProvider({ search: searchResult([], { aggregations: aggs }) })
   const res = await runSearch(provider, { index: 'logs', body: buildSearchBody({ query: {}, size: 0, aggs }) })
   assert.deepEqual(res.aggregations, aggs)
+})
+
+// ── computeTruncated: pure truth table ──────────────────────────────────────
+test('computeTruncated reports truncation from the total value and relation only', () => {
+  // exact count ('eq'): truncated only when more matched than we returned
+  assert.equal(computeTruncated({ value: 3, relation: 'eq' }, 3), false)
+  assert.equal(computeTruncated({ value: 100, relation: 'eq' }, 20), true)
+  assert.equal(computeTruncated({ value: 20, relation: 'eq' }, 20), false)
+  // capped lower bound ('gte'): the true total may exceed the count, so a value
+  // that only equals what we returned is still treated as truncated
+  assert.equal(computeTruncated({ value: 10000, relation: 'gte' }, 20), true)
+  assert.equal(computeTruncated({ value: 20, relation: 'gte' }, 20), true)
+  // no usable total -> no evidence of truncation
+  assert.equal(computeTruncated(undefined, 5), false)
+  assert.equal(computeTruncated({ value: NaN, relation: 'eq' }, 5), false)
 })

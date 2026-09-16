@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Evidence secret redaction** — documents read back from the cluster are now
+  sanitized at a single egress boundary before they reach the model context, a
+  tool result or the UI. `sanitizeDocument` redacts credential-shaped field
+  *values* by key name (`password`, `passwd`, `pwd`, `secret`, `token`,
+  `authorization`, `cookie`, `credential`, `api_key`, `access_token`,
+  `refresh_token`, `client_secret`, …, matched case-insensitively across
+  snake/camel/kebab and recursed through nested objects and arrays) and obvious
+  credential shapes inside strings (`Bearer …`, `Basic …`, `password=…`,
+  `api_key=…`, `token=…`, `sk-…`), while preserving the surrounding non-secret
+  evidence. It is applied to `searchops_logs`, `searchops_context`,
+  `searchops_investigate` samples, `searchops_aggregate` bucket keys and
+  `searchops_query` output. This is best-effort and deterministic — not a DLP
+  system: it never scrubs arbitrary high-entropy strings, so trace ids and
+  innocent fields such as `token_count` or `password_policy_enabled` survive
+  intact, and a secret with no recognizable shape can still slip through.
+- **Field auto-detection for every log tool** — `searchops_logs`,
+  `searchops_context` and `searchops_aggregate` now resolve their field profile
+  through the same `explicit profile → mapping auto-detection → convention`
+  precedence that `searchops_investigate` already used, via a shared
+  `resolveSourceFields` helper. Previously only investigate consulted the mapping,
+  so a non-default schema (e.g. `ts` / `msg` / `app`) was silently queried with
+  the wrong field names on the other three tools. The mapping is read at most once
+  per tool invocation; a mapping failure (timeout, `403`, parse error) degrades
+  gracefully to convention instead of failing the call.
+- **Truthful `truncated` flag** — `truncated` is no longer a false positive when a
+  query simply returned fewer rows than the requested page size. It is set only
+  when the total relation proves more matches existed than were returned
+  (`total.value > returned` for an exact `eq` count, `>=` for a lower-bound `gte`
+  count), so a complete small result (`total=3`, `returned=3`) is correctly
+  reported as not truncated.
+
 ## [0.1.0] — initial release
 
 First public version of **dsh-searchops**: an agent-native search, log
