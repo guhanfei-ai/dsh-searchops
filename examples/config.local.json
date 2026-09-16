@@ -1,0 +1,24 @@
+{
+  "sources": [
+    {
+      "id": "local",
+      "name": "local",
+      "provider": "opensearch",
+      "auth": "none",
+      "url": "http://localhost:9200",
+      "profile": "ecs"
+    }
+  ],
+  "profiles": [
+    {
+      "name": "ecs",
+      "timestampField": "@timestamp",
+      "messageField": "message",
+      "serviceField": "service.name",
+      "levelField": "log.level",
+      "traceIdField": "trace.id"
+    }
+  ],
+  "defaultSource": "local",
+  "allowInsecureHttp": false
+}

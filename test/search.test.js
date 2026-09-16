@@ -1,0 +1,162 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import {
+  DEFAULT_QUERY_SIZE,
+  HARD_MAX_SIZE,
+  MAX_QUERY_SIZE,
+  MAX_TRACK_TOTAL_HITS,
+} from '../lib/constants.js'
+import {
+  buildSearchBody,
+  clampFrom,
+  clampSize,
+  normalizeSourceFilter,
+  normalizeTrackTotalHits,
+  runSearch,
+  validateQueryDsl,
+} from '../lib/search.js'
+import { fakeProvider, hit, searchResult } from './support.mjs'
+
+// ── clampSize: the "size = 10000000" guard ──────────────────────────────────
+test('clampSize applies the default when size is omitted', () => {
+  assert.deepEqual(clampSize(undefined), { size: DEFAULT_QUERY_SIZE, clamped: false })
+  assert.deepEqual(clampSize(''), { size: DEFAULT_QUERY_SIZE, clamped: false })
+})
+
+test('clampSize passes through a reasonable size', () => {
+  assert.deepEqual(clampSize(50), { size: 50, clamped: false })
+  assert.deepEqual(clampSize('30'), { size: 30, clamped: false })
+})
+
+test('clampSize clamps an absurd size down to the cap and flags it', () => {
+  assert.deepEqual(clampSize(10_000_000), { size: MAX_QUERY_SIZE, clamped: true })
+  assert.deepEqual(clampSize(999), { size: MAX_QUERY_SIZE, clamped: true })
+})
+
+test('clampSize never exceeds the absolute hard ceiling even with a larger max', () => {
+  const res = clampSize(100_000, { def: 20, max: 999_999 })
+  assert.equal(res.size, HARD_MAX_SIZE)
+  assert.equal(res.clamped, true)
+})
+
+test('clampSize falls back to the default for non-finite or sub-1 input', () => {
+  assert.deepEqual(clampSize(0), { size: DEFAULT_QUERY_SIZE, clamped: false })
+  assert.deepEqual(clampSize(-5), { size: DEFAULT_QUERY_SIZE, clamped: false })
+  assert.deepEqual(clampSize('abc'), { size: DEFAULT_QUERY_SIZE, clamped: false })
+})
+
+// ── clampFrom: deep-pagination guard ────────────────────────────────────────
+test('clampFrom defaults to 0 and rejects deep pagination', () => {
+  assert.deepEqual(clampFrom(undefined), { from: 0 })
+  assert.deepEqual(clampFrom(100), { from: 100 })
+  assert.deepEqual(clampFrom(-1), { from: 0 })
+  assert.throws(() => clampFrom(20_000), /exceeds the 10000 offset limit/)
+})
+
+// ── track_total_hits cap ────────────────────────────────────────────────────
+test('normalizeTrackTotalHits passes booleans and caps numbers', () => {
+  assert.equal(normalizeTrackTotalHits(true), true)
+  assert.equal(normalizeTrackTotalHits(false), false)
+  assert.equal(normalizeTrackTotalHits(undefined), MAX_TRACK_TOTAL_HITS)
+  assert.equal(normalizeTrackTotalHits(500), 500)
+  assert.equal(normalizeTrackTotalHits(1_000_000_000), MAX_TRACK_TOTAL_HITS)
+})
+
+// ── _source filter normalization ────────────────────────────────────────────
+test('normalizeSourceFilter handles booleans, strings, arrays and include/exclude', () => {
+  assert.equal(normalizeSourceFilter(undefined), undefined)
+  assert.equal(normalizeSourceFilter(false), false)
+  assert.deepEqual(normalizeSourceFilter('message'), ['message'])
+  assert.deepEqual(normalizeSourceFilter(['a', 'b', '', null]), ['a', 'b'])
+  assert.deepEqual(normalizeSourceFilter({ includes: ['a'], excludes: ['b'] }), { includes: ['a'], excludes: ['b'] })
+  assert.equal(normalizeSourceFilter({}), undefined)
+})
+
+// ── query DSL validation ────────────────────────────────────────────────────
+test('validateQueryDsl defaults empty input to match_all', () => {
+  assert.deepEqual(validateQueryDsl(undefined), { match_all: {} })
+  assert.deepEqual(validateQueryDsl({}), { match_all: {} })
+})
+
+test('validateQueryDsl accepts an object or a JSON string of one', () => {
+  assert.deepEqual(validateQueryDsl({ term: { a: 1 } }), { term: { a: 1 } })
+  assert.deepEqual(validateQueryDsl('{"term":{"a":1}}'), { term: { a: 1 } })
+})
+
+test('validateQueryDsl rejects malformed JSON, non-objects and oversized bodies', () => {
+  assert.throws(() => validateQueryDsl('{not json}'), /must be a JSON object/)
+  assert.throws(() => validateQueryDsl('[1,2,3]'), /must parse to a JSON object/)
+  assert.throws(() => validateQueryDsl(42), /must be a JSON object/)
+  const huge = { term: { a: 'x'.repeat(40 * 1024) } }
+  assert.throws(() => validateQueryDsl(huge), /too large/)
+})
+
+// ── buildSearchBody ─────────────────────────────────────────────────────────
+test('buildSearchBody assembles size, query, track_total_hits and omits empty parts', () => {
+  const body = buildSearchBody({ query: { term: { a: 1 } }, size: 20 })
+  assert.equal(body.size, 20)
+  assert.deepEqual(body.query, { term: { a: 1 } })
+  assert.equal(body.track_total_hits, MAX_TRACK_TOTAL_HITS)
+  assert.equal(body.from, undefined)
+  assert.equal(body.sort, undefined)
+  assert.equal(body.aggs, undefined)
+})
+
+test('buildSearchBody includes from, sort, _source and aggs when provided', () => {
+  const body = buildSearchBody({
+    query: {},
+    size: 0,
+    from: 10,
+    sort: [{ '@timestamp': { order: 'desc' } }],
+    sourceFilter: ['message'],
+    aggs: { group_by: { terms: { field: 'service.name', size: 10 } } },
+  })
+  assert.equal(body.from, 10)
+  assert.deepEqual(body.sort, [{ '@timestamp': { order: 'desc' } }])
+  assert.deepEqual(body._source, ['message'])
+  assert.ok(body.aggs.group_by)
+})
+
+test('buildSearchBody ignores an empty aggs object and empty sort array', () => {
+  const body = buildSearchBody({ query: {}, size: 5, aggs: {}, sort: [] })
+  assert.equal(body.aggs, undefined)
+  assert.equal(body.sort, undefined)
+})
+
+// ── runSearch: envelope + truncation disclosure ─────────────────────────────
+test('runSearch validates the index pattern before calling the provider', async () => {
+  const { provider, calls } = fakeProvider({})
+  await assert.rejects(() => runSearch(provider, { index: 'bad index', body: {} }), /invalid index name or pattern/)
+  assert.equal(calls.search.length, 0)
+})
+
+test('runSearch normalizes the result envelope and reports truncation on a capped count', async () => {
+  const { provider } = fakeProvider({ search: searchResult([hit('1', 'logs', {})], { total: { value: 10000, relation: 'gte' } }) })
+  const res = await runSearch(provider, { index: 'logs', body: buildSearchBody({ query: {}, size: 1 }) })
+  assert.equal(res.returned, 1)
+  assert.equal(res.requested, 1)
+  assert.deepEqual(res.total, { value: 10000, relation: 'gte' })
+  assert.equal(res.truncated, true)
+})
+
+test('runSearch reports truncated when fewer hits came back than were requested', async () => {
+  const { provider } = fakeProvider({ search: searchResult([hit('1', 'logs', {})], { total: { value: 5, relation: 'eq' } }) })
+  const res = await runSearch(provider, { index: 'logs', body: buildSearchBody({ query: {}, size: 5 }) })
+  assert.equal(res.returned, 1)
+  assert.equal(res.requested, 5)
+  assert.equal(res.truncated, true)
+})
+
+test('runSearch is not truncated when everything requested came back', async () => {
+  const { provider } = fakeProvider({ search: searchResult([hit('1', 'logs', {})], { total: { value: 1, relation: 'eq' } }) })
+  const res = await runSearch(provider, { index: 'logs', body: buildSearchBody({ query: {}, size: 1 }) })
+  assert.equal(res.truncated, false)
+})
+
+test('runSearch forwards aggregations from the provider result', async () => {
+  const aggs = { group_by: { buckets: [{ key: 'payment', doc_count: 3 }] } }
+  const { provider } = fakeProvider({ search: searchResult([], { aggregations: aggs }) })
+  const res = await runSearch(provider, { index: 'logs', body: buildSearchBody({ query: {}, size: 0, aggs }) })
+  assert.deepEqual(res.aggregations, aggs)
+})

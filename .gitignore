@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build artifacts (this plugin is plain ESM — nothing to build)
+dist/
+
+# Logs & OS noise
+*.log
+.DS_Store
+._*
+
+# Local env / secrets — never commit credentials
+.env
+.env.*
+*.local
+
+# Editor / agent scratch dirs
+.qwen/
+.reasonix/
+.zcode/
+.codebuddy/
+.workbuddy/
+.kilo/
+.idea/
+.vscode/
+_logs/
+_plans/
+_prompts/
+audit/

@@ -1,0 +1,34 @@
+{
+  "sources": [
+    {
+      "id": "prod-search",
+      "name": "prod",
+      "provider": "opensearch",
+      "auth": "basic",
+      "url": "https://search-prod.example.com:9200",
+      "usernameRef": "SEARCHOPS_USERNAME_prodsearch",
+      "passwordRef": "SEARCHOPS_PASSWORD_prodsearch",
+      "profile": "ecs"
+    },
+    {
+      "id": "staging-search",
+      "name": "staging",
+      "provider": "opensearch",
+      "auth": "bearer",
+      "url": "https://search-staging.example.com:9200",
+      "tokenRef": "SEARCHOPS_TOKEN_stagingsearch"
+    }
+  ],
+  "profiles": [
+    {
+      "name": "ecs",
+      "timestampField": "@timestamp",
+      "messageField": "message",
+      "serviceField": "service.name",
+      "levelField": "log.level",
+      "traceIdField": "trace.id"
+    }
+  ],
+  "defaultSource": "prod",
+  "allowInsecureHttp": false
+}
