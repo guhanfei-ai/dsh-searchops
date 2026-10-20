@@ -27,3 +27,5 @@ _logs/
 _plans/
 _prompts/
 audit/
+_tacp
+.video_agent
