@@ -148,10 +148,11 @@ export function hit(id, index, source, sort) {
 }
 
 // ── Mock plugin ctx for apply() ─────────────────────────────────────────────
-// credentials is a plain map ref -> secret value. The settings service is absent
-// (inject is a no-op), so apply() uses the entry config it was handed — the same
-// fallback path a host without the settings service would take.
-export function createPluginContext({ credentials = {}, config = {} } = {}) {
+// credentials is a plain map ref -> secret value. Without `settings`, inject is
+// a no-op and apply() uses the entry config it was handed — the same fallback
+// path a host without the settings service would take. With `settings`, inject
+// delivers it the way cordis would.
+export function createPluginContext({ credentials = {}, config = {}, settings } = {}) {
   const tools = []
   const sections = []
   const resolved = []
@@ -162,7 +163,9 @@ export function createPluginContext({ credentials = {}, config = {} } = {}) {
         return Object.prototype.hasOwnProperty.call(credentials, ref) ? { value: credentials[ref] } : undefined
       },
     },
-    inject() {}, // no settings service -> entry-config fallback
+    inject(deps, cb) {
+      if (settings && deps.includes('settings')) cb({ settings, effect() {} })
+    },
     systemPrompt: { section(section) { sections.push(section) } },
     tools: { register(tool) { tools.push(tool); return () => {} } },
   }

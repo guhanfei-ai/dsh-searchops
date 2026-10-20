@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import * as plugin from '../index.js'
-import { createPluginContext, twoSourceConfig } from './support.mjs'
+import { createPluginContext, execution, toolByName, twoSourceConfig } from './support.mjs'
 
 const TOOL_NAMES = [
   'searchops_sources',
@@ -17,7 +17,7 @@ const TOOL_NAMES = [
 ]
 
 const INTERNAL_KEYS = [
-  'validateConfig', 'effectiveSources', 'resolveSource', 'resolveSourceProfile', 'resolveFieldProfile',
+  'validateConfig', 'unwrapVolatile', 'effectiveSources', 'resolveSource', 'resolveSourceProfile', 'resolveFieldProfile',
   'parseTimeRange', 'normalizeMessage', 'fingerprint', 'groupPatterns', 'buildSearchBody', 'clampSize',
   'clampFrom', 'runLogs', 'runAggregate', 'runContext', 'runInvestigate', 'renderInvestigation',
   'createProvider', 'createRuntime', 'normalizeBaseUrl', 'validateIndexPattern', 'redactSecrets',
@@ -71,16 +71,104 @@ test('apply rejects an unsupported provider', () => {
   assert.throws(() => plugin.apply(ctx, { sources: [{ name: 'x', provider: 'solr' }] }), /Unsupported provider/)
 })
 
+// ── settings integration: both host generations ─────────────────────────────
+// 0.1.7 removed settings.register/scope (see the _tacp notes); a 0.2.0 host
+// skips plugins whose callback throws there, so apply() must branch on the
+// method's presence instead of assuming it.
+test('pre-0.1.7 host (settings.register present) registers the searchops namespace', async () => {
+  const registered = {}
+  const settings = {
+    register(ns, schema, opts) {
+      registered.ns = ns
+      registered.schema = schema
+      registered.opts = opts
+      let value = structuredClone(opts.base)
+      return {
+        get: () => value,
+        set(next) { value = next },
+      }
+    },
+  }
+  const { ctx, tools } = createPluginContext({ settings })
+  const config = twoSourceConfig()
+  plugin.apply(ctx, config)
+  assert.equal(registered.ns, 'searchops')
+  assert.equal(typeof registered.schema, 'function')
+  assert.equal(registered.opts.validate, plugin.internals.validateConfig)
+  assert.deepEqual(registered.opts.base, { profiles: [], allowInsecureHttp: false, ...config })
+  assert.equal(tools.length, 9)
+  // the scope's live value (not the entry snapshot) feeds the runtime
+  const tool = toolByName(tools, 'searchops_sources')
+  const before = await tool.execute({}, execution())
+  assert.match(before, /name="prod"/)
+})
+
+test('0.1.7+ host (register removed) works via describe() instead of throwing', async () => {
+  const liveValue = {
+    sources: [{ id: 'l1', name: 'live', provider: 'opensearch', auth: 'none', url: 'http://127.0.0.1:9200' }],
+    profiles: [],
+    defaultSource: 'live',
+    allowInsecureHttp: true,
+  }
+  const settings = {
+    describe: () => [{ ns: 'searchops', value: liveValue }],
+  }
+  const { ctx, tools } = createPluginContext({ settings })
+  plugin.apply(ctx, twoSourceConfig()) // entry config differs from the live value
+  assert.equal(tools.length, 9)
+  const tool = toolByName(tools, 'searchops_sources')
+  const out = await tool.execute({}, execution())
+  assert.match(out, /name="live"/)
+  assert.doesNotMatch(out, /name="prod"/)
+})
+
+test('0.1.7+ host falls back to the entry config when the namespace is not in describe()', async () => {
+  const settings = { describe: () => [] }
+  const { ctx, tools } = createPluginContext({ settings })
+  const config = twoSourceConfig()
+  plugin.apply(ctx, config)
+  const tool = toolByName(tools, 'searchops_sources')
+  const out = await tool.execute({}, execution())
+  assert.match(out, /name="prod"/)
+})
+
 // ── Config schema: secure defaults ──────────────────────────────────────────
 test('the Config schema defaults to no sources and insecure HTTP off', () => {
-  const resolved = plugin.Config({})
+  const { unwrapVolatile } = plugin.internals
+  const resolved = unwrapVolatile(plugin.Config({}))
   assert.deepEqual(resolved.sources, [])
   assert.deepEqual(resolved.profiles, [])
   assert.equal(resolved.allowInsecureHttp, false) // secure by default
 })
 
+// 0.1.7+ hosts wrap .volatile() fields in Volatile refs; apply() must unwrap
+// them before validation so every consumer sees plain values.
+test('unwrapVolatile strips Volatile refs recursively and passes plain values through', () => {
+  const { unwrapVolatile } = plugin.internals
+  const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+  const volatileRef = (value) => ({ [VOLATILE_WRITE]: () => {}, get: () => value })
+  const wrapped = {
+    sources: volatileRef([{ id: 's1', name: 'prod', url: 'https://x.example.com' }]),
+    defaultSource: volatileRef('prod'),
+    allowInsecureHttp: volatileRef(false),
+    profiles: [],
+  }
+  const unwrapped = unwrapVolatile(wrapped)
+  assert.deepEqual(unwrapped.sources, [{ id: 's1', name: 'prod', url: 'https://x.example.com' }])
+  assert.equal(unwrapped.defaultSource, 'prod')
+  assert.equal(unwrapped.allowInsecureHttp, false)
+  const plain = { sources: [], profiles: [], defaultSource: '', allowInsecureHttp: false }
+  assert.deepEqual(unwrapVolatile(plain), plain)
+  // apply() accepts a volatile-wrapped config the same as a plain one
+  const { ctx, tools } = createPluginContext({})
+  plugin.apply(ctx, wrapped)
+  assert.equal(tools.length, 9)
+})
+
 test('the Config schema preserves valid operator input', () => {
-  const resolved = plugin.Config({ sources: [{ name: 'prod', url: 'https://search.example.com', auth: 'bearer' }], defaultSource: 'prod' })
+  // volatile 字段解析后是 Volatile 引用；消费方（apply）一律先 unwrap。
+  const { unwrapVolatile } = plugin.internals
+  const resolved = unwrapVolatile(plugin.Config({ sources: [{ name: 'prod', url: 'https://search.example.com', auth: 'bearer' }], defaultSource: 'prod' }))
   assert.equal(resolved.sources[0].name, 'prod')
   assert.equal(resolved.defaultSource, 'prod')
 })

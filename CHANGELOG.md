@@ -6,7 +6,71 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Editable settings form** — the settings page's SearchOps section is now a
+  full form (the dsh-grafana settings-card pattern): per-source cards with
+  name / URL / auth mode / username / password-or-token / field profile
+  inputs, add/remove sources, set-default, a plain-HTTP toggle, and a single
+  save that writes secrets first (`remote.credentials.set`, write-only,
+  blank keeps the current value) and then the whole config in one
+  `remote.settings.mutate` transaction with optimistic revision checking.
+  Secret values never enter config rows; ids of hand-written sources are
+  synthesized name-derived exactly like the host's `stableIdFromName`.
+
+- **Web sidebar panel** — a client half (`client.js`, no build step, loaded via
+  the host ModuleLoader) adds a "SearchOps" button to the conversation header
+  that opens a read-only side panel listing every configured source (sanitized
+  URL, auth mode, bound field profile, default badge, credentials
+  configured/missing) with a per-source connectivity check (cluster name,
+  version/distribution, health, node count). Data flows over two loopback
+  same-origin RPC endpoints registered by the host half (`lib/rpc.js`):
+  `searchops/catalog` and `searchops/status`, reusing the runtime's existing
+  sanitized source list and provider ping/health path — credentials remain
+  boolean-only, responses stay secret-free and size-capped. On hosts with the
+  better-sidebar plugin the panel registers as a native sidebar tab instead;
+  otherwise it renders as a self-hosted resizable right-side panel
+  (`--dsh-searchops-width`, the dsh-zterm standalone pattern). A
+  `settings.section` entry puts the same source overview and connectivity
+  check into the settings page's left navigation. The connection
+  service is wired through an optional nested inject on both halves: a host
+  without it still loads the plugin and the panel shows an upgrade hint.
+
+### Changed
+
+- **0.2.x host compatibility (peer range)** — the `@deepseek-ai/dsh-tools`
+  peer range now includes the 0.1.7, 0.2.0 and 0.2.1 lines
+  (`^0.1.7-alpha.0 || ^0.2.0-alpha.0 || ^0.2.1-alpha.0`), replacing the
+  redundant `^0.1.5-rc.0` branch. From 0.2.0 the host hard-checks plugin
+  peers and silently skips non-matching plugins, so without this the plugin
+  would not load at all on current hosts. Hosts `0.2.1-rc.2`, `0.2.0-rc.2`,
+  `0.1.7-rc.2` and the existing 0.1.x range all satisfy the new peer set;
+  `0.3.0` correctly does not. Dev dependency bumped to `0.2.1-rc.2`; every
+  settings/tool API surface this plugin uses (tools.register,
+  systemPrompt.section, credentials.resolve, settings describe) is unchanged
+  on 0.2.1-rc.2.
+- **Publish registry pinned** — `publishConfig.registry` now points at
+  `https://registry.npmjs.org` explicitly, so publishing from a machine whose
+  npm default is a mirror registry is not rejected.
+
 ### Fixed
+
+- **`settings.register` guard** — `apply()` no longer assumes the settings
+  service exposes `register()`. On pre-0.1.7 hosts it registers the
+  `searchops` namespace as before; on 0.1.7+ hosts (where `register`/`scope`
+  were removed) it synthesizes the active config from
+  `settings.describe()` instead, with the entry config as fallback. Previously
+  the unconditional call threw `register is not a function` inside the inject
+  callback on 0.1.7+/0.2.0 hosts, which cordis swallowed — leaving settings
+  integration dead and spamming err.log.
+- **Volatile-marked Config fields** — `sources`, `profiles`, `defaultSource`
+  and `allowInsecureHttp` are now marked `.volatile()`. The 0.1.7+ settings
+  service only exposes (and accepts writes for) namespaces whose schema has
+  volatile fields, so without the markers the searchops namespace was absent
+  from `settings.describe()` entirely: neither the generic plugin settings
+  page nor any settings UI could edit it. `apply()` unwraps the resulting
+  `Volatile` references (`unwrapVolatile`) so every consumer keeps seeing
+  plain values.
 
 - **Evidence secret redaction** — documents read back from the cluster are now
   sanitized at a single egress boundary before they reach the model context, a

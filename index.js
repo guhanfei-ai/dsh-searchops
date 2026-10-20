@@ -9,8 +9,9 @@
 import Schema from '@deepseek-ai/schemastery'
 
 import { SETTINGS_NAMESPACE } from './lib/constants.js'
-import { effectiveSources, resolveSource, resolveSourceProfile, validateConfig } from './lib/config.js'
+import { effectiveSources, resolveSource, resolveSourceProfile, unwrapVolatile, validateConfig } from './lib/config.js'
 import { createRuntime } from './lib/runtime.js'
+import { registerSearchopsRpc } from './lib/rpc.js'
 import { resolveFieldProfile } from './lib/fields.js'
 import { parseTimeRange } from './lib/time.js'
 import { normalizeBaseUrl, redactSecrets, validateIndexPattern } from './lib/util.js'
@@ -78,21 +79,25 @@ const SourceConfig = Schema.object({
   profile: Schema.string().default('').description('Name of the field profile bound to this source; empty = auto-detect per index.'),
 })
 
+// .volatile() 是 0.1.7+ settings 门禁：未标 volatile 的字段不进 describe、
+// 不可被 update/mutate 写入（旧宿主忽略该 meta，行为不变）。全部四个字段都
+// 是运行时可编辑项。
 export const Config = Schema.object({
-  sources: Schema.array(SourceConfig).default([]).description('Configured search sources. Each has a unique name, a read-only id, a provider, a base URL, an auth mode and credential references (never secret values).'),
-  profiles: Schema.array(ProfileConfig).default([]).description('Optional field profiles for non-standard log schemas. A source selects one by name; the profile named "default" is the fallback.'),
-  defaultSource: Schema.string().default('').description('Name or id of the source used when a tool call omits the source argument. With exactly one source it is the default automatically.'),
-  allowInsecureHttp: Schema.boolean().default(false).description('Allow plain HTTP for non-loopback search hosts. Off by default: use HTTPS or target localhost, unless you explicitly accept credentials traveling over plain HTTP.'),
+  sources: Schema.array(SourceConfig).default([]).volatile().description('Configured search sources. Each has a unique name, a read-only id, a provider, a base URL, an auth mode and credential references (never secret values).'),
+  profiles: Schema.array(ProfileConfig).default([]).volatile().description('Optional field profiles for non-standard log schemas. A source selects one by name; the profile named "default" is the fallback.'),
+  defaultSource: Schema.string().default('').volatile().description('Name or id of the source used when a tool call omits the source argument. With exactly one source it is the default automatically.'),
+  allowInsecureHttp: Schema.boolean().default(false).volatile().description('Allow plain HTTP for non-loopback search hosts. Off by default: use HTTPS or target localhost, unless you explicitly accept credentials traveling over plain HTTP.'),
 })
 
 export function apply(ctx, config = {}) {
-  const entryConfig = {
+  // 0.1.7+ 宿主把 volatile 字段的值包成 Volatile 引用；先拆包再进校验/运行时。
+  const entryConfig = unwrapVolatile({
     sources: [],
     profiles: [],
     defaultSource: '',
     allowInsecureHttp: false,
     ...config,
-  }
+  })
   validateConfig(entryConfig)
 
   // Effective config: when the settings service is available its resolved value
@@ -101,11 +106,23 @@ export function apply(ctx, config = {}) {
   // getter (not a snapshot) so settings edits take effect on the next call.
   let activeConfig = () => entryConfig
   ctx.inject(['settings'], (sctx) => {
-    const scope = sctx.settings.register(SETTINGS_NAMESPACE, Config, {
-      base: entryConfig,
-      validate: validateConfig,
-    })
-    activeConfig = () => scope.get()
+    const settings = sctx.settings
+    if (typeof settings.register === 'function') {
+      // Pre-0.1.7 hosts: the plugin registers its own settings namespace.
+      const scope = settings.register(SETTINGS_NAMESPACE, Config, {
+        base: entryConfig,
+        validate: validateConfig,
+      })
+      activeConfig = () => scope.get()
+    } else {
+      // 0.1.7+ removed register/scope: the loader discovers the flat-exported
+      // Config schema and describe() carries the host-resolved live value.
+      // Entry values stay as the fallback until the namespace appears there.
+      activeConfig = () => ({
+        ...entryConfig,
+        ...settings.describe?.()?.find?.((row) => row?.ns === SETTINGS_NAMESPACE)?.value,
+      })
+    }
     sctx.effect(() => () => {
       activeConfig = () => entryConfig
     })
@@ -125,6 +142,14 @@ export function apply(ctx, config = {}) {
   ctx.tools.register(defineSearchopsAggregateTool(rt))
   ctx.tools.register(defineSearchopsContextTool(rt))
   ctx.tools.register(defineSearchopsInvestigateTool(rt))
+
+  // Sidebar panel endpoints for the web client half. Optional on purpose:
+  // hosts without the connection service simply never register the routes,
+  // and the panel shows its "host too old" hint instead.
+  ctx.inject(['connection'], (cctx) => {
+    const dispose = registerSearchopsRpc(cctx, cctx.connection, rt)
+    cctx.effect(() => () => { dispose() })
+  })
 }
 
 // Curated pure/stateful surface exposed for host introspection and tests. These
@@ -132,6 +157,7 @@ export function apply(ctx, config = {}) {
 export const internals = Object.freeze({
   // config & fields
   validateConfig,
+  unwrapVolatile,
   effectiveSources,
   resolveSource,
   resolveSourceProfile,
