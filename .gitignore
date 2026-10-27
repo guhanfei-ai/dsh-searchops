@@ -29,3 +29,9 @@ _prompts/
 audit/
 _tacp
 .video_agent
+# AI 协作入口只留本地，不进 Git
+AGENTS.md
+# 发布产物、发布日志与本地 AI 发布执行器
+dist/
+output/
+/deploy_agent.sh
